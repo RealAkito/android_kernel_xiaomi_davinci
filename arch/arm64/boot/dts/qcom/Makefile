@@ -1,6 +1,6 @@
 ifeq ($(CONFIG_MACH_XIAOMI_SDMMAGPIE),y)
 ifeq ($(CONFIG_BUILD_ARM64_DT_OVERLAY),y)
-dtbo-$(CONFIG_ARCH_SDMMAGPIE) += \
+dtbo-$(CONFIG_MACH_XIAOMI_F10) += \
 		davinci-sdmmagpie-overlay.dtbo \
 		davinci_m0a-sdmmagpie-overlay.dtbo \
 		davinci_m0b-sdmmagpie-overlay.dtbo
@@ -8,6 +8,11 @@ dtbo-$(CONFIG_ARCH_SDMMAGPIE) += \
 davinci-sdmmagpie-overlay.dtbo-base := sdmmagpie.dtb
 davinci_m0a-sdmmagpie-overlay.dtbo-base := sdmmagpie.dtb
 davinci_m0b-sdmmagpie-overlay.dtbo-base := sdmmagpie.dtb
+else
+dtb-$(CONFIG_MACH_XIAOMI_F10) += \
+		davinci-sdmmagpie.dtb \
+		davinci_m0a-sdmmagpie.dtb \
+		davinci_m0b-sdmmagpie.dtb
 endif
 else
 # SPDX-License-Identifier: GPL-2.0
