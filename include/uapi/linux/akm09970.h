@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0+ WITH Linux-syscall-note */
 /*
  * Copyright (c) 2018-2019, Linux Foundation. All rights reserved.
+ * Copyright (C) 2019 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -14,7 +15,7 @@
 #include <linux/types.h>
 #include <linux/ioctl.h>
 
-//#define pr_fmt(fmt) "akm09970: %s: %d " fmt, __func__, __LINE__
+
 
 #define AKM09970_DRV_NAME       "akm09970"
 #define AKM09970_CLASS_NAME     "akm"
@@ -83,16 +84,16 @@ struct akm09970_platform_data {
 
 /* IOC CMD */
 #define AKM_IOC_SET_ACTIVE \
-	_IOW(AKM_IOC_MAGIC, AKM_PRIVATE + 1, struct akm09970_platform_data)
+        _IOW(AKM_IOC_MAGIC, AKM_PRIVATE + 1, struct akm09970_platform_data)
 
 #define AKM_IOC_SET_MODE \
-	_IOW(AKM_IOC_MAGIC, AKM_PRIVATE + 2, struct akm09970_platform_data)
+        _IOW(AKM_IOC_MAGIC, AKM_PRIVATE + 2, struct akm09970_platform_data)
 
 #define AKM_IOC_GET_SENSEDATA \
-	_IOR(AKM_IOC_MAGIC, AKM_PRIVATE + 4, struct akm09970_platform_data)
+        _IOR(AKM_IOC_MAGIC, AKM_PRIVATE + 4, struct akm09970_platform_data)
 
 #define AKM_IOC_GET_SENSSMR \
-	_IOR(AKM_IOC_MAGIC, AKM_PRIVATE + 5, struct akm09970_platform_data)
+        _IOR(AKM_IOC_MAGIC, AKM_PRIVATE + 5, struct akm09970_platform_data)
 
 
 #endif /* __AKM09970_H__ */

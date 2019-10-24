@@ -1,6 +1,7 @@
 /* drivers/intput/misc/akm09970.c - akm09970 compass driver
  *
- * Copyright (c) 2014-2015, Linux Foundation. All rights reserved.
+ * Copyright (c) 2018-2019, Linux Foundation. All rights reserved.
+ * Copyright (C) 2019 XiaoMi, Inc.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -13,95 +14,80 @@
  *
  */
 
-//#define DEBUG
+
 #define pr_fmt(fmt) "akm09970: %s: %d " fmt, __func__, __LINE__
 
-#include <linux/delay.h>
-#include <linux/device.h>
-#include <linux/freezer.h>
-#include <linux/gpio.h>
-#include <linux/i2c.h>
-#include <linux/input.h>
-#include <linux/interrupt.h>
-#include <linux/irq.h>
-#include <linux/miscdevice.h>
 #include <linux/module.h>
+#include <linux/delay.h>
+#include <linux/interrupt.h>
+#include <linux/i2c.h>
 #include <linux/slab.h>
-#include <linux/uaccess.h>
-#include <linux/workqueue.h>
-#include <linux/regulator/consumer.h>
-#include <linux/of_gpio.h>
-#include <linux/types.h>
-#include <linux/errno.h>
-#include <linux/fcntl.h>
-#include <linux/poll.h>
-#include <linux/mutex.h>
-#include <linux/spinlock.h>
-#include <linux/seq_file.h>
-#include <linux/pwm.h>
-#include <linux/mm.h>
+#include <linux/platform_device.h>
+#include <linux/fs.h>
+#include <linux/regmap.h>
+#include <linux/atomic.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
-#include <linux/hrtimer.h>
-#include <linux/debugfs.h>
-#include <uapi/misc/akm09970.h>
+#include <linux/gpio.h>
+#include <linux/of_gpio.h>
+#include <linux/device.h>
+#include <linux/cdev.h>
+#include <linux/ioctl.h>
+#include <linux/kernel.h>
+#include <linux/fcntl.h>
+#include <linux/stat.h>
+#include <linux/unistd.h>
+#include <linux/initrd.h>
+#include <linux/init.h>
+#include <linux/string.h>
+#include <asm/uaccess.h>
+#include <linux/poll.h>
+#include <linux/wait.h>
+#include <linux/regulator/consumer.h>
+#include "uapi/linux/akm09970.h"
 
-#define AKM_DRDY_TIMEOUT_MS		100
-#define AKM_DEFAULT_MEASURE_HZ	10
-#define AKM_I2C_NAME			"akm09970"
 
-#define MAKE_S16(U8H, U8L) \
-	(int16_t)(((uint16_t)(U8H) << 8) | (uint16_t)(U8L))
-
-/* POWER SUPPLY VOLTAGE RANGE */
-#define AKM09970_VDD_MIN_UV 1800000
-#define AKM09970_VDD_MAX_UV 1800000
-
-#define PWM_PERIOD_DEFAULT_NS 1000000
-
+static DECLARE_WAIT_QUEUE_HEAD(poll_wait_queue);
 
 struct akm09970_soc_ctrl {
-	struct i2c_client *client;
-	struct input_dev *input;
-	struct miscdevice miscdev;
-	struct dentry *debugfs;
+	uint8_t chip_info[AKM_SENSOR_INFO_SIZE];
+	uint8_t chip_data[AKM_SENSOR_DATA_SIZE];
+	uint8_t measure_range;
+	uint32_t measure_freq_hz;
+
+	atomic_t power_enabled;
+	atomic_t data_ready;
+
+	int gpio_reset;
+	int gpio_irq;
+	int irq;
+
+	struct akm09970_platform_data pdata;
+
+	dev_t dev_num;
+	struct device *dev;
+	struct cdev cdev;
+	struct class *chr_class;
+	struct device *chr_dev;
 
 	struct device_node *of_node;
+
+	struct i2c_client *client;
+
 	struct pinctrl *pinctrl;
-	struct pinctrl_state *pinctrl_default;
-//	struct pinctrl_state *pinctrl_sleep;
+	struct pinctrl_state *gpio_state_active;
+	struct pinctrl_state *gpio_state_suspend;
 
 	struct regulator *vdd;
-	int gpio_rstn;
-	int gpio_irq;
-
-	int power_enabled;
 
 	struct work_struct report_work;
 	struct workqueue_struct *work_queue;
-
-	struct mutex soc_mutex;
-	wait_queue_head_t drdy_wq;
-	atomic_t drdy;
-
-	int irq;
-
-	uint8_t sense_info[AKM_SENSOR_INFO_SIZE];
-//	uint8_t sense_conf[AKM_SENSOR_CONF_SIZE];
-	uint8_t sense_data[AKM_SENSOR_DATA_SIZE];
-	int32_t magnet_data[3];
-	uint8_t layout;
-
-	uint32_t measure_freq_hz;
-	uint8_t measure_range;
 };
 
 
-static int akm_write_byte(struct i2c_client *client, u8 reg, u8 val)
+static int akm09970_write_byte(struct i2c_client *client, u8 reg, u8 val)
 {
 	int rc;
 
-	/* As per specification, disable irq in between register writes */
 	if (client->irq)
 		disable_irq_nosync(client->irq);
 
@@ -113,7 +99,7 @@ static int akm_write_byte(struct i2c_client *client, u8 reg, u8 val)
 	return rc;
 }
 
-static int akm_set_reg_bits(struct i2c_client *client,
+static int akm09970_set_reg_bits(struct i2c_client *client,
 					int val, int shift, u8 mask, u8 reg)
 {
 	int data;
@@ -124,225 +110,270 @@ static int akm_set_reg_bits(struct i2c_client *client,
 
 	data = (data & ~mask) | ((val << shift) & mask);
 	pr_info("reg: 0x%x, data: 0x%x", reg, data);
-	return akm_write_byte(client, reg, data);
+	return akm09970_write_byte(client, reg, data);
 }
 
-static int akm_set_smr(
-	struct akm09970_soc_ctrl *pctrl,
+static int akm09970_set_mode(
+	struct akm09970_soc_ctrl *c_ctrl,
 	uint8_t mode)
 {
 	int rc;
 
-	rc = akm_set_reg_bits(pctrl->client, mode, AK09970_SMR_MODE_POS,
-				AK09970_SMR_MODE_MSK, AK09970_SMR_MODE_REG);
-
-	return rc;
-}
-
-static int akm_set_mode(
-	struct akm09970_soc_ctrl *pctrl,
-	uint8_t mode)
-{
-	int rc;
-
-	rc = akm_set_reg_bits(pctrl->client, mode, AK09970_MODE_POS,
+	rc = akm09970_set_reg_bits(c_ctrl->client, mode, AK09970_MODE_POS,
 				AK09970_MODE_MSK, AK09970_MODE_REG);
 
 	return rc;
 }
 
-static void akm_reset(
-	struct akm09970_soc_ctrl *pctrl)
+static void akm09970_reset(
+	struct akm09970_soc_ctrl *c_ctrl)
 {
-	gpio_set_value(pctrl->gpio_rstn, 0);
-	udelay(20);
-	gpio_set_value(pctrl->gpio_rstn, 1);
+	gpio_set_value(c_ctrl->gpio_reset, 0);
+	udelay(50);
+	gpio_set_value(c_ctrl->gpio_reset, 1);
 	udelay(100);
 
-	atomic_set(&pctrl->drdy, 0);
 	return;
 }
 
-static int akm_power_down(struct akm09970_soc_ctrl *pctrl)
+static int akm09970_power_down(struct akm09970_soc_ctrl *c_ctrl)
 {
 	int rc = 0;
 
-	if (pctrl->power_enabled) {
-		gpio_set_value(pctrl->gpio_rstn, 0);
+	if (atomic_read(&c_ctrl->power_enabled)) {
+		gpio_set_value(c_ctrl->gpio_reset, 0);
 
-		rc = regulator_disable(pctrl->vdd);
+		rc = regulator_disable(c_ctrl->vdd);
 		if (rc) {
 			pr_err("Regulator vdd disable failed rc=%d\n", rc);
 		}
-		pr_debug("power down");
-		atomic_set(&pctrl->drdy, 0);
+		atomic_set(&c_ctrl->power_enabled, 0);
+		pr_debug("Power down successfully");
 	}
 
 	return rc;
 }
 
-static int akm_power_up(struct akm09970_soc_ctrl *pctrl)
+static int akm09970_power_up(struct akm09970_soc_ctrl *c_ctrl)
 {
 	int rc = 0;
 
-	if (!pctrl->power_enabled) {
-		rc = regulator_enable(pctrl->vdd);
+	if (!atomic_read(&c_ctrl->power_enabled)) {
+		rc = regulator_enable(c_ctrl->vdd);
 		if (rc) {
 			pr_err("Regulator vdd enable failed rc=%d\n", rc);
 			return rc;
 		}
-		pr_info("power up");
-
-		akm_reset(pctrl);
-
-		return rc;
+		udelay(20);
+		akm09970_reset(c_ctrl);
+		atomic_set(&c_ctrl->power_enabled, 1);
+		pr_debug("Power down successfully");
 	}
 
 	return rc;
 }
 
-/* This function will block a process until the latest measurement
- * data is available.
- */
-static int akm_get_data(
-	struct akm09970_soc_ctrl *pctrl,
-	int *rbuf,
-	int size)
+static int akm09970_active(struct akm09970_soc_ctrl *c_ctrl, bool on)
 {
-	long timeout;
+	int rc = 0;
+	uint8_t mode = 0x00;
 
-	/* Block! */
-	timeout = wait_event_interruptible_timeout(
-			pctrl->drdy_wq,
-			atomic_read(&pctrl->drdy),
-			msecs_to_jiffies(AKM_DRDY_TIMEOUT_MS));
+	pr_info("akm sensor %s\n", on ? "on" : "off");
 
-	if (!timeout) {
-		pr_err("wait_event timeout");
-		return -EIO;
+	if (!atomic_read(&c_ctrl->power_enabled) && on) {
+		rc = akm09970_power_up(c_ctrl);
+		if (rc) {
+			pr_err("Sensor power up fail!\n");
+			return rc;
+		}
+
+		if (c_ctrl->measure_freq_hz >= 100)
+			mode = AK09970_MODE_CONTINUOUS_100HZ;
+		else if (c_ctrl->measure_freq_hz >= 50 && c_ctrl->measure_freq_hz < 100)
+			mode = AK09970_MODE_CONTINUOUS_50HZ;
+		else if (c_ctrl->measure_freq_hz >= 20 && c_ctrl->measure_freq_hz < 50)
+			mode = AK09970_MODE_CONTINUOUS_20HZ;
+		else
+			mode = AK09970_MODE_CONTINUOUS_10HZ;
+
+		c_ctrl->measure_range = 0;
+
+		rc = akm09970_write_byte(c_ctrl->client, AK09970_MODE_REG, (mode | c_ctrl->measure_range));
+		if (rc < 0) {
+			pr_err("Failed to set mode and smr.");
+			akm09970_power_down(c_ctrl);
+			return rc;
+		}
+		pr_info("reg: 0x%x, data: 0x%x", AK09970_MODE_REG, (mode | c_ctrl->measure_range));
+
+		enable_irq(c_ctrl->irq);
+		pr_debug("Enable irq successfully");
+	} else if (atomic_read(&c_ctrl->power_enabled) && !on) {
+		disable_irq_nosync(c_ctrl->irq);
+		cancel_work_sync(&c_ctrl->report_work);
+		pr_err("Disable irq successfully");
+
+		rc = akm09970_set_mode(c_ctrl, AK09970_MODE_POWERDOWN);
+		if (rc)
+			pr_warn("Failed to set to POWERDOWN mode.\n");
+
+		akm09970_power_down(c_ctrl);
+	} else {
+		pr_info("The same power state, do nothing!");
 	}
-
-	memcpy(rbuf, pctrl->magnet_data, sizeof(int) * size);
-	atomic_set(&pctrl->drdy, 0);
 
 	return 0;
 }
 
-static int akm_active(struct akm09970_soc_ctrl *pctrl, bool on)
+static int akm09970_read_data(struct akm09970_soc_ctrl *c_ctrl)
 {
 	int rc = 0;
-	uint8_t mode;
 
-	pr_info("akm sensor %s\n", on ? "on" : "off");
+        rc = i2c_smbus_read_i2c_block_data(c_ctrl->client, AK09970_REG_ST_XYZ, AKM_SENSOR_DATA_SIZE, c_ctrl->chip_data);
+        if (rc < 0) {
+                pr_err("read data failed!");
+                return rc;
+        }
 
-	if (!pctrl->power_enabled && on) {
-		pctrl->power_enabled = true;
-		rc = akm_power_up(pctrl);
-		if (rc) {
-			pr_err("Sensor power up fail!\n");
-			pctrl->power_enabled = false;
-			return rc;
-		}
+        if (AKM_ERRADC_IS_HIGH(c_ctrl->chip_data[0])) {
+                pr_err("ADC over run!\n");
+                rc = -EIO;
+        }
 
-		if (pctrl->measure_freq_hz >= 100)
-			mode = AK09970_MODE_CONTINUOUS_100HZ;
-		else if (pctrl->measure_freq_hz >= 50 && pctrl->measure_freq_hz < 100)
-			mode = AK09970_MODE_CONTINUOUS_50HZ;
-		else if (pctrl->measure_freq_hz >= 20 && pctrl->measure_freq_hz < 50)
-			mode = AK09970_MODE_CONTINUOUS_20HZ;
-		else
-			mode = AK09970_MODE_CONTINUOUS_10HZ;
-		rc = akm_set_mode(pctrl, mode);
-		if (rc < 0) {
-			pr_err("Failed to set to mode(%d)", mode);
-			pctrl->power_enabled = false;
-			return rc;
-		}
-		pctrl->measure_range = 0;
-		rc = akm_set_smr(pctrl, pctrl->measure_range);
-		if (rc < 0) {
-			pr_err("Failed to set smr.");
-			pctrl->power_enabled = false;
-			return rc;
-		}
-		pr_debug("enable irq");
-		enable_irq(pctrl->client->irq);
-	} else if (pctrl->power_enabled && !on) {
-		pctrl->power_enabled = false;
-
-		disable_irq_nosync(pctrl->client->irq);
-		cancel_work_sync(&pctrl->report_work);
-		pr_debug("disable irq");
-
-		rc = akm_set_mode(pctrl, AK09970_MODE_POWERDOWN);
-		if (rc)
-			pr_warn("Failed to set to POWERDOWN mode.\n");
-
-		akm_power_down(pctrl);
-	} else {
-		pr_info("power state is the same, do nothing!");
-	}
+        if (AKM_ERRXY_IS_HIGH(c_ctrl->chip_data[1])) {
+                pr_err("Errxy over run!\n");
+                rc = -EIO;
+        }
 
 	return 0;
+}
+
+static void akm09970_dev_work_queue(struct work_struct *work)
+{
+	int rc = 0;
+	struct akm09970_soc_ctrl *c_ctrl =
+		container_of(work, struct akm09970_soc_ctrl, report_work);
+
+	rc = akm09970_read_data(c_ctrl);
+	if (rc < 0) {
+		atomic_set(&c_ctrl->data_ready, 0);
+		pr_warn("Failed to read data");
+	} else {
+		atomic_set(&c_ctrl->data_ready, 1);
+		wake_up(&poll_wait_queue);
+	}
+}
+
+static irqreturn_t akm09970_irq_handler(int irq, void *dev_id)
+{
+        struct akm09970_soc_ctrl *c_ctrl = dev_id;
+
+        queue_work(c_ctrl->work_queue, &c_ctrl->report_work);
+
+        return IRQ_HANDLED;
+}
+
+static int akm09970_release(struct inode *inp, struct file *filp)
+{
+	int rc = 0;
+
+	return rc;
+}
+
+static int akm09970_open(struct inode *inp, struct file *filp)
+{
+	int rc = 0;
+	struct akm09970_soc_ctrl *c_ctrl =
+		container_of(inp->i_cdev, struct akm09970_soc_ctrl, cdev);
+
+	filp->private_data = c_ctrl;
+
+	pr_debug("open enter, irq = %d\n", c_ctrl->irq);
+
+	return rc;
+}
+
+static ssize_t akm09970_write(struct file *filp, const char *buf, size_t len, loff_t *fseek)
+{
+	int rc = 0;
+
+	return rc;
+}
+
+static ssize_t akm09970_read(struct file *filp, char *buf, size_t len, loff_t *fseek)
+{
+	int rc = 0;
+
+	return rc;
+}
+
+static unsigned int akm09970_poll(struct file *filp, poll_table *wait)
+{
+	unsigned int mask = 0;
+	struct akm09970_soc_ctrl *c_ctrl = filp->private_data;
+
+	pr_debug("Poll enter\n");
+
+	poll_wait(filp, &poll_wait_queue, wait);
+	if (atomic_read(&c_ctrl->data_ready)) {
+		atomic_set(&c_ctrl->data_ready, 0);
+		mask = POLLIN | POLLRDNORM;
+	}
+
+	return mask;
 }
 
 static long akm09970_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	int rc = 0;
-	uint8_t active = 0;
-	uint8_t mode = AK09970_MODE_POWERDOWN;
-	int dat_buf[3];/* for GET_DATA */
-	int state = 1;
-	struct akm09970_soc_ctrl *pctrl = NULL;
+	int i = 0;
+	struct akm09970_soc_ctrl *c_ctrl = filp->private_data;
 
-	pctrl = container_of(filp->private_data, struct akm09970_soc_ctrl, miscdev);
-
-	if (pctrl == NULL)
+	if (NULL == c_ctrl) {
+                pr_err("NULL");
 		return -EFAULT;
+	}
 
-//	mutex_lock(&pctrl->soc_mutex);
+	if (_IOC_TYPE(cmd) != AKM_IOC_MAGIC) {
+		pr_err("magic number worng");
+		return -ENODEV;
+	}
+
+	if (_IOC_DIR(cmd) & _IOC_READ)
+		rc = !access_ok(VERIFY_WRITE, (void __user *)arg, _IOC_SIZE(cmd));
+	else if (_IOC_DIR(cmd) & _IOC_WRITE)
+		rc = !access_ok(VERIFY_READ, (void __user *)arg, _IOC_SIZE(cmd));
+	if (rc) {
+		pr_err("access failed");
+		return -EFAULT;
+	}
+
+	if (_IOC_DIR(cmd) & _IOC_WRITE) {
+		if (copy_from_user(&c_ctrl->pdata, (void __user *)arg, sizeof(struct akm09970_platform_data))) {
+			pr_err("Copy data from user space failed");
+			return -EFAULT;
+		}
+	}
 
 	switch (cmd) {
 	case AKM_IOC_SET_ACTIVE:
-		pr_debug("AKM_IOC_SET_ACTIVE.");
-		if (copy_from_user(&active, (uint8_t *)arg, sizeof(uint8_t))) {
-			pr_err("Failed to active status from user to kernel\n");
-			rc = -EFAULT;
-			break;
-		}
-		rc = akm_active(pctrl, !!active);
+		pr_err("AKM_IOC_SET_ACTIVE, c_ctrl->pdata.sensor_state = %d\n", c_ctrl->pdata.sensor_state);
+		rc = akm09970_active(c_ctrl, c_ctrl->pdata.sensor_state);
 		break;
 	case AKM_IOC_SET_MODE:
-		pr_debug("AKM_IOC_SET_MODE.");
-		if (copy_from_user(&mode, (uint8_t *)arg, sizeof(uint8_t))) {
-			pr_err("Failed to copy mode from user to kernel\n");
-			rc = -EFAULT;
-			break;
-		}
-		pctrl->measure_freq_hz = mode;
-		//rc = akm_set_mode(pctrl, mode);
-		break;
-	case AKM_IOC_SET_PRESS:
-		pr_debug("AKM_IOC_SET_PRESS.");
-		input_event(pctrl->input, EV_KEY, KEY_BACK, state);
-		input_sync(pctrl->input);
-		input_event(pctrl->input, EV_KEY, KEY_BACK, !state);
-		input_sync(pctrl->input);
+		pr_err("AKM_IOC_SET_MODE, c_ctrl->pdata.sensor_mode = %d\n", c_ctrl->pdata.sensor_mode);
+		c_ctrl->measure_freq_hz = c_ctrl->pdata.sensor_mode;
+
 		break;
 	case AKM_IOC_GET_SENSSMR:
-		if (copy_to_user((void __user *)arg, &pctrl->measure_range, sizeof(uint8_t))) {
-			pr_err("copy_to_user failed.");
-			return -EFAULT;
-		}
+		pr_err("AKM_IOC_GET_SENSSMR, c_ctrl->measure_range = %d", c_ctrl->measure_range);
+		c_ctrl->pdata.sensor_smr = c_ctrl->measure_range;
 		break;
 	case AKM_IOC_GET_SENSEDATA:
-		pr_info("AKM_IOC_GET_SENSEDATA.");
-		rc = akm_get_data(pctrl, dat_buf, 3);
-		if (rc < 0)
-			return rc;
-		if (copy_to_user((void __user *)arg, dat_buf, sizeof(dat_buf))) {
-			pr_err("copy_to_user failed.");
-			return -EFAULT;
+		pr_debug("AKM_IOC_GET_SENSEDATA");
+		for (i = 0; i < AKM_SENSOR_DATA_SIZE; i++) {
+			c_ctrl->pdata.data[i] = c_ctrl->chip_data[i];
+			pr_debug("data%d = %d\n", i, c_ctrl->chip_data[i]);
 		}
 		break;
 	default:
@@ -350,7 +381,13 @@ static long akm09970_ioctl(struct file *filp, unsigned int cmd, unsigned long ar
 		break;
 	}
 
-//	mutex_unlock(&pctrl->soc_mutex);
+	if (_IOC_DIR(cmd) & _IOC_READ) {
+		if (copy_to_user((void __user *)arg, &c_ctrl->pdata, sizeof(struct akm09970_platform_data))) {
+			pr_err("Copy data from user space failed");
+			return -EFAULT;
+		}
+	}
+
 	return rc;
 }
 
@@ -362,419 +399,217 @@ static long akm09970_compat_ioctl(struct file *filp, unsigned int cmd, unsigned 
 #endif
 
 static const struct file_operations akm09970_fops = {
-	.owner =	THIS_MODULE,
+	.owner = THIS_MODULE,
+	.open = akm09970_open,
+	.release = akm09970_release,
+	.read = akm09970_read,
+	.write = akm09970_write,
 	.unlocked_ioctl = akm09970_ioctl,
 #ifdef CONFIG_COMPAT
 	.compat_ioctl = akm09970_compat_ioctl,
 #endif
+	.poll = akm09970_poll,
 };
 
-/* akm get and report data functions */
-static int akm_read_sense_data(
-	struct akm09970_soc_ctrl *pctrl,
-	uint8_t *rbuf,
-	int size)
-{
-	uint8_t buffer[AKM_SENSOR_DATA_SIZE];
-	int rc;
 
-	/* Read data */
-	rc = i2c_smbus_read_i2c_block_data(pctrl->client, AK09970_REG_ST_XYZ, AKM_SENSOR_DATA_SIZE, buffer);
-	if (rc < 0) {
-		pr_err("read data failed!");
-		return rc;
-	}
-
-	/* ERRADC is */
-	if (AKM_ERRADC_IS_HIGH(buffer[0])) {
-		pr_err("ADC over run!\n");
-		rc = -EIO;
-	}
-
-	/* ERRXY is */
-	if (AKM_ERRXY_IS_HIGH(buffer[1])) {
-		pr_err("errxy over run!\n");
-		rc = -EIO;
-	}
-
-	/* Check ST bit */
-	if (!(AKM_DRDY_IS_HIGH(buffer[1]))) {
-		pr_info("DRDY is low. Use last value.");
-	} else {
-		memcpy(rbuf, buffer, size);
-		atomic_set(&pctrl->drdy, 1);
-
-		wake_up(&pctrl->drdy_wq);
-	}
-
-	return 0;
-}
-
-static int akm_report_data(struct akm09970_soc_ctrl *pctrl)
+static int akm09970_check_device_id(
+        struct akm09970_soc_ctrl *c_ctrl)
 {
 	int rc = 0;
-	int tmp, mag_x, mag_y, mag_z;
 
-	rc = akm_read_sense_data(pctrl, pctrl->sense_data, AKM_SENSOR_DATA_SIZE);
-	if (rc) {
-		pr_err("Get data failed.");
-		return -EIO;
-	}
-
-	mag_x = MAKE_S16(pctrl->sense_data[2], pctrl->sense_data[3]);
-	mag_y = MAKE_S16(pctrl->sense_data[4], pctrl->sense_data[5]);
-	mag_z = MAKE_S16(pctrl->sense_data[6], pctrl->sense_data[7]);
-
-	//pr_debug("mag_x:%d mag_y:%d mag_z:%d\n", mag_x, mag_y, mag_z);
-	pr_debug("raw data: 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x",
-			pctrl->sense_data[0], pctrl->sense_data[1], pctrl->sense_data[2], pctrl->sense_data[3],
-			pctrl->sense_data[4], pctrl->sense_data[5], pctrl->sense_data[6], pctrl->sense_data[7]);
-
-	switch (pctrl->layout) {
-	case 0:
-	case 1:
-		/* Fall into the default direction */
-		break;
-	case 2:
-		tmp = mag_x;
-		mag_x = mag_y;
-		mag_y = -tmp;
-		break;
-	case 3:
-		mag_x = -mag_x;
-		mag_y = -mag_y;
-		break;
-	case 4:
-		tmp = mag_x;
-		mag_x = -mag_y;
-		mag_y = tmp;
-		break;
-	case 5:
-		mag_x = -mag_x;
-		mag_z = -mag_z;
-		break;
-	case 6:
-		tmp = mag_x;
-		mag_x = mag_y;
-		mag_y = tmp;
-		mag_z = -mag_z;
-		break;
-	case 7:
-		mag_y = -mag_y;
-		mag_z = -mag_z;
-		break;
-	case 8:
-		tmp = mag_x;
-		mag_x = -mag_y;
-		mag_y = -tmp;
-		mag_z = -mag_z;
-		break;
-	}
-
-	input_report_abs(pctrl->input, ABS_X, mag_x);
-	input_report_abs(pctrl->input, ABS_Y, mag_y);
-	input_report_abs(pctrl->input, ABS_Z, mag_z);
-
-	pctrl->magnet_data[0] = mag_x;
-	pctrl->magnet_data[1] = mag_y;
-	pctrl->magnet_data[2] = mag_z;
-
-	input_sync(pctrl->input);
-
-//	enable_irq(pctrl->client->irq);
-
-	return 0;
-}
-
-static void akm_dev_input_work(struct work_struct *work)
-{
-	int rc = 0;
-	struct akm09970_soc_ctrl *pctrl;
-
-	pctrl = container_of(work, struct akm09970_soc_ctrl, report_work);
-
-	rc = akm_report_data(pctrl);
+	rc = akm09970_power_up(c_ctrl);
 	if (rc < 0)
-		pr_warn("Failed to report data.");
-}
-
-static irqreturn_t akm_irq(int irq, void *handle)
-{
-	struct akm09970_soc_ctrl *pctrl = handle;
-
-//	disable_irq_nosync(pctrl->client->irq);
-	queue_work(pctrl->work_queue, &pctrl->report_work);
-
-	pr_debug("enter");
-	return IRQ_HANDLED;
-}
-
-int akm_input_open(struct input_dev *dev)
-{
-	pr_info("enter!!!!!");
-	return 0;
-}
-
-void akm_input_close(struct input_dev *dev)
-{
-	pr_info("enter!!!!!");
-	return;
-}
-
-static int akm09970_input_register(
-	struct input_dev **input)
-{
-	int rc = 0;
-
-	/* Declare input device */
-	*input = input_allocate_device();
-	if (!*input)
-		return -ENOMEM;
-
-	/* Setup input device */
-	set_bit(EV_ABS, (*input)->evbit);
-	input_set_abs_params(*input, ABS_X,
-			-32767, 32767, 0, 0);
-	input_set_abs_params(*input, ABS_Y,
-			-32767, 32767, 0, 0);
-	input_set_abs_params(*input, ABS_Z,
-			-32767, 32767, 0, 0);
-
-	set_bit(EV_KEY, (*input)->evbit);
-	input_set_capability(*input, EV_KEY, KEY_BACK);
-	/* Set name */
-	(*input)->name = AKM_INPUT_DEVICE_NAME;
-	(*input)->open = akm_input_open;
-	(*input)->close = akm_input_close;
-
-	/* Register */
-	rc = input_register_device(*input);
-	if (rc) {
-		input_free_device(*input);
 		return rc;
+
+	rc = i2c_smbus_read_i2c_block_data(c_ctrl->client, AK09970_REG_WIA, AKM_SENSOR_INFO_SIZE, c_ctrl->chip_info);
+	if (rc < 0)
+		goto exit;
+
+	if ((c_ctrl->chip_info[0] != AK09970_WIA1_VALUE) ||
+			(c_ctrl->chip_info[1] != AK09970_WIA2_VALUE)) {
+		pr_err("The device is not AKM Hall sensor\n");
+		rc = -ENXIO;
 	}
+
+exit:
+	akm09970_power_down(c_ctrl);
 
 	return rc;
 }
 
-static int akm_i2c_check_device(
-	struct i2c_client *client)
+static ssize_t akm09970_chip_rev_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
 {
-	int rc = 0;
-	struct akm09970_soc_ctrl *pctrl = i2c_get_clientdata(client);
+	struct akm09970_soc_ctrl *c_ctrl = dev_get_drvdata(dev);
 
-	rc = i2c_smbus_read_i2c_block_data(client, AK09970_REG_WIA, AKM_SENSOR_INFO_SIZE, pctrl->sense_info);
-	if (rc < 0) {
-		dev_err(&client->dev, "%s(), I2C access failed: %d", __func__, rc);
-		return rc;
-	}
-
-	/* Check read data */
-	if ((pctrl->sense_info[0] != AK09970_WIA1_VALUE) ||
-			(pctrl->sense_info[1] != AK09970_WIA2_VALUE)) {
-		pr_err("The device is not AKM Compass.");
-		return -ENXIO;
-	}
-
-	return rc;
+	return sprintf(buf, "%x,%x\n", (char)c_ctrl->chip_info[0], (char)c_ctrl->chip_info[1]);
 }
+static DEVICE_ATTR(chip_rev, S_IRUGO, akm09970_chip_rev_show, NULL);
 
-static int akm09970_regulator_init(struct akm09970_soc_ctrl *pctrl, bool on)
+static struct device_attribute *akm_attrs[] = {
+	&dev_attr_chip_rev,
+};
+
+static int akm09970_regulator_init(struct akm09970_soc_ctrl *c_ctrl, bool on)
 {
 	int rc;
 
 	if (on) {
-		pctrl->vdd = regulator_get(&pctrl->client->dev, "vdd");
-		if (IS_ERR(pctrl->vdd)) {
-			rc = PTR_ERR(pctrl->vdd);
+		c_ctrl->vdd = regulator_get(&c_ctrl->client->dev, "vdd");
+		if (IS_ERR(c_ctrl->vdd)) {
+			rc = PTR_ERR(c_ctrl->vdd);
 			pr_err("Regulator get failed vdd rc=%d", rc);
 			return rc;
 		}
 
-		if (regulator_count_voltages(pctrl->vdd) > 0) {
-			rc = regulator_set_voltage(pctrl->vdd,
+		if (regulator_count_voltages(c_ctrl->vdd) > 0) {
+			rc = regulator_set_voltage(c_ctrl->vdd,
 				AKM09970_VDD_MIN_UV, AKM09970_VDD_MAX_UV);
 			if (rc) {
 				pr_err("Regulator set failed vdd rc=%d",
 					rc);
-				regulator_put(pctrl->vdd);
+				regulator_put(c_ctrl->vdd);
 				return rc;
 			}
 		}
 	} else {
-		if (regulator_count_voltages(pctrl->vdd) > 0)
-			regulator_set_voltage(pctrl->vdd, 0,
-				AKM09970_VDD_MAX_UV);
+		if (regulator_count_voltages(c_ctrl->vdd) > 0)
+			regulator_set_voltage(c_ctrl->vdd, 0,
+		        	AKM09970_VDD_MAX_UV);
 
-		regulator_put(pctrl->vdd);
+		regulator_put(c_ctrl->vdd);
 	}
 
 	return 0;
 }
 
-static int akm09970_gpio_config(struct akm09970_soc_ctrl *pctrl)
+static int akm09970_gpio_config(struct akm09970_soc_ctrl *c_ctrl)
 {
-	int32_t rc = 0;
+        int32_t rc = 0;
 
-	rc = gpio_request_one(pctrl->gpio_rstn, GPIOF_OUT_INIT_LOW, "akm09970-rstn");
-	if (rc < 0) {
-		pr_err("Failed to request power enable GPIO %d", pctrl->gpio_rstn);
-		goto fail0;
+        rc = gpio_request_one(c_ctrl->gpio_reset, GPIOF_OUT_INIT_LOW, "akm09970-reset");
+        if (rc < 0) {
+                pr_err("Failed to request power enable GPIO %d", c_ctrl->gpio_reset);
+                goto reset_gpio_req_err;
+        }
+        gpio_direction_output(c_ctrl->gpio_reset, 0);
+
+        rc = gpio_request_one(c_ctrl->gpio_irq, GPIOF_IN, "akm09970-irq");
+        if (rc < 0) {
+                pr_err("Failed to request power enable GPIO %d", c_ctrl->gpio_irq);
+                goto irq_gpio_req_err;
+        } else {
+        	gpio_direction_input(c_ctrl->gpio_irq);
+		c_ctrl->irq = gpio_to_irq(c_ctrl->gpio_irq);
+		rc = request_threaded_irq(c_ctrl->irq, akm09970_irq_handler, NULL,
+			IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+			"akm09970_irq", c_ctrl);
+		if (rc < 0) {
+			pr_err("Unable to request irq\n");
+			goto irq_req_err;
+		}
+		disable_irq_nosync(c_ctrl->irq);
 	}
-	gpio_direction_output(pctrl->gpio_rstn, 0);
 
-	rc = gpio_request_one(pctrl->gpio_irq, GPIOF_IN, "akm09970-irq");
-	if (rc < 0) {
-		pr_err("Failed to request power enable GPIO %d", pctrl->gpio_irq);
-		goto fail1;
+
+        return 0;
+
+irq_req_err:
+	if (gpio_is_valid(c_ctrl->gpio_irq)) {
+		if (c_ctrl->irq)
+			free_irq(c_ctrl->irq, c_ctrl);
+		gpio_free(c_ctrl->gpio_irq);
 	}
-	gpio_direction_input(pctrl->gpio_irq);
 
-	return 0;
+irq_gpio_req_err:
+        if (gpio_is_valid(c_ctrl->gpio_reset))
+                gpio_free(c_ctrl->gpio_reset);
 
-fail1:
-	if (gpio_is_valid(pctrl->gpio_rstn))
-		gpio_free(pctrl->gpio_rstn);
-fail0:
+reset_gpio_req_err:
+        return rc;
+}
+
+
+static int akm09970_pinctrl_select(struct akm09970_soc_ctrl *c_ctrl, bool state)
+{
+	int rc = 0;
+	struct pinctrl_state *pins_state =
+		state ? (c_ctrl->gpio_state_active) : (c_ctrl->gpio_state_suspend);
+
+	rc = pinctrl_select_state(c_ctrl->pinctrl, pins_state);
+	if (rc < 0)
+		pr_err("Failed to select pins state %s\n",
+			state ? "active" : "suspend");
+
 	return rc;
 }
 
-static int akm09970_pinctrl_init(struct akm09970_soc_ctrl *pctrl)
+static int akm09970_pinctrl_init(struct akm09970_soc_ctrl *c_ctrl)
 {
-	int rc = 0;
-	/* Get pinctrl if target uses pinctrl */
-	pctrl->pinctrl = devm_pinctrl_get(&pctrl->client->dev);
+        int rc = 0;
+        struct device *dev = c_ctrl->dev;
 
-	if (IS_ERR_OR_NULL(pctrl->pinctrl)) {
-		rc = PTR_ERR(pctrl->pinctrl);
-		pr_err("Target does not use pinctrl %d", rc);
-		goto err_pinctrl_get;
-	}
+	c_ctrl->pinctrl = devm_pinctrl_get(dev);
+        if (IS_ERR_OR_NULL(c_ctrl->pinctrl)) {
+                rc = PTR_ERR(c_ctrl->pinctrl);
+                pr_err("Unable to acquire pinctrl %d", rc);
+                goto err_pinctrl_get;
+        }
 
-	pctrl->pinctrl_default
-		= pinctrl_lookup_state(pctrl->pinctrl, "default");
-	if (IS_ERR_OR_NULL(pctrl->pinctrl_default)) {
-		rc = PTR_ERR(pctrl->pinctrl_default);
-		pr_err("Can not lookup default pinstate %d", rc);
+	c_ctrl->gpio_state_active =
+		pinctrl_lookup_state(c_ctrl->pinctrl, "akm09970_gpio_active");
+	if (IS_ERR_OR_NULL(c_ctrl->gpio_state_active)) {
+		pr_err("Cannot lookup active pinctrl state\n");
+		rc = PTR_ERR(c_ctrl->gpio_state_active);
 		goto err_pinctrl_lookup;
 	}
-/*
-	pctrl->pinctrl_sleep
-		= pinctrl_lookup_state(pctrl->pinctrl, "sleep");
-	if (IS_ERR_OR_NULL(pctrl->pinctrl_sleep)) {
-		rc = PTR_ERR(pctrl->pinctrl_sleep);
-		pr_err("Can not lookup default pinstate %d", rc);
-		goto err_pinctrl_lookup;
-	}*/
 
-	return 0;
+	c_ctrl->gpio_state_suspend =
+		pinctrl_lookup_state(c_ctrl->pinctrl, "akm09970_gpio_suspend");
+	if (IS_ERR_OR_NULL(c_ctrl->gpio_state_suspend)) {
+		pr_err("Cannot lookup suspend pinctrl state\n");
+		rc = PTR_ERR(c_ctrl->gpio_state_suspend);
+		goto err_pinctrl_lookup;
+	}
+
+        return 0;
 
 err_pinctrl_lookup:
-	devm_pinctrl_put(pctrl->pinctrl);
+        devm_pinctrl_put(c_ctrl->pinctrl);
 err_pinctrl_get:
-	pctrl->pinctrl = NULL;
+        c_ctrl->pinctrl = NULL;
 
-	return rc;
+        return rc;
 }
 
-int akm09970_parse_dt(struct device *dev,
-				struct akm09970_soc_ctrl *pctrl)
+static int akm09970_parse_dt(struct device *dev,
+                                struct akm09970_soc_ctrl *c_ctrl)
+{
+        int rc = 0;
+
+        c_ctrl->gpio_reset = of_get_named_gpio_flags(dev->of_node, "akm,gpio-reset", 0, NULL);
+        if (!gpio_is_valid(c_ctrl->gpio_reset)) {
+                pr_err("Gpio reset pin %d is invalid.",
+                        c_ctrl->gpio_reset);
+                return -EINVAL;
+        }
+
+        c_ctrl->gpio_irq = of_get_named_gpio_flags(dev->of_node, "akm,gpio-irq", 0, NULL);
+        if (!gpio_is_valid(c_ctrl->gpio_irq)) {
+                pr_err("gpio irq pin %d is invalid.",
+                        c_ctrl->gpio_irq);
+                return -EINVAL;
+        }
+
+        return rc;
+}
+
+static int akm09970_probe(struct i2c_client *client, const struct i2c_device_id *id)
 {
 	int rc = 0;
+	struct akm09970_soc_ctrl *c_ctrl = NULL;
 
-	pctrl->gpio_rstn = of_get_named_gpio_flags(dev->of_node, "akm,gpio_rstn", 0, NULL);
-	if (!gpio_is_valid(pctrl->gpio_rstn)) {
-		pr_err("gpio reset pin %d is invalid.",
-			pctrl->gpio_rstn);
-		return -EINVAL;
-	}
-
-	pctrl->gpio_irq = of_get_named_gpio_flags(dev->of_node, "akm,gpio_irq", 0, NULL);
-	if (!gpio_is_valid(pctrl->gpio_irq)) {
-		pr_err("gpio irq pin %d is invalid.",
-			pctrl->gpio_irq);
-		return -EINVAL;
-	}
-
-	pctrl->client->irq = gpio_to_irq(pctrl->gpio_irq);
-
-	rc = of_property_read_u32(dev->of_node, "akm,measure-freq-hz", &pctrl->measure_freq_hz);
-	if (rc < 0) {
-		pr_info("akm,measure-freq-hz not set, use default.");
-		pctrl->measure_freq_hz = AKM_DEFAULT_MEASURE_HZ;
-	}
-
-	return 0;
-}
-
-static ssize_t sensor_id_read(struct file *filp, char __user *ubuf,
-		size_t cnt, loff_t *ppos)
-{
-	char data[8] = {0};
-	struct akm09970_soc_ctrl *pctrl = filp->private_data;
-
-	snprintf(data, sizeof(data), "0x%02x%02x\n", pctrl->sense_info[1], pctrl->sense_info[0]);
-
-	return simple_read_from_buffer(ubuf, cnt, ppos, data, strlen(data));
-}
-
-static const struct file_operations sensor_id_fops = {
-	.open	= simple_open,
-	.read	= sensor_id_read,
-};
-
-static int akm_reg_dbg_show(struct seq_file *s, void *p)
-{
-	struct akm09970_soc_ctrl *pctrl = s->private;
-	int rc = 0;
-	uint8_t buffer[8] = {0};
-
-	rc = i2c_smbus_read_i2c_block_data(pctrl->client, AK09970_REG_ST_XYZ, 8, buffer);
-	if (rc < 0) {
-		pr_err("read data failed!");
-		return 0;
-	}
-	seq_printf(s, "reg[0x17]: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-		buffer[0], buffer[1], buffer[2], buffer[3],
-		buffer[4], buffer[5], buffer[6], buffer[7]);
-
-	rc = i2c_smbus_read_i2c_block_data(pctrl->client, AK09970_REG_CNTL1, 2, buffer);
-	if (rc < 0) {
-		pr_err("read data failed!");
-		return 0;
-	}
-	seq_printf(s, "reg[0x20]: %02x %02x\n", buffer[0], buffer[1]);
-
-	rc = i2c_smbus_read_i2c_block_data(pctrl->client, AK09970_REG_CNTL2, 1, buffer);
-	if (rc < 0) {
-		pr_err("read data failed!");
-		return 0;
-	}
-
-	seq_printf(s, "reg[0x21]: %02x\n", buffer[0]);
-
-	return 0;
-}
-
-static int akm_reg_dbg_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, akm_reg_dbg_show, inode->i_private);
-}
-
-static const struct file_operations dump_reg_fops = {
-	.owner		= THIS_MODULE,
-	.open		= akm_reg_dbg_open,
-	.llseek		= seq_lseek,
-	.read		= seq_read,
-	.release	= single_release,
-};
-
-int akm09970_probe(struct i2c_client *client, const struct i2c_device_id *id)
-{
-	int rc = 0;
-	struct akm09970_soc_ctrl *pctrl = NULL;
-
-	dev_info(&client->dev, "%s start probe.", __func__);
+	pr_debug("Probe enter");
 
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
 		pr_err("check_functionality failed.");
@@ -782,199 +617,199 @@ int akm09970_probe(struct i2c_client *client, const struct i2c_device_id *id)
 	}
 
 	/* Allocate memory for driver data */
-	pctrl = kzalloc(sizeof(struct akm09970_soc_ctrl), GFP_KERNEL);
-	if (!pctrl) {
-		pr_err("memory allocation failed.");
-		rc = -ENOMEM;
-		goto exit1;
+	c_ctrl = devm_kzalloc(&client->dev, sizeof(struct akm09970_soc_ctrl), GFP_KERNEL);
+	if (!c_ctrl) {
+		pr_err("Alloc memory failed.");
+		return -ENOMEM;
 	}
 
-	/* set client data */
-	pctrl->client = client;
-	i2c_set_clientdata(client, pctrl);
-
-	/* parse dt */
-	pr_debug("start parse dt.");
+	pr_debug("Start parse device tree");
 	if (client->dev.of_node) {
-		rc = akm09970_parse_dt(&client->dev, pctrl);
+		rc = akm09970_parse_dt(&client->dev, c_ctrl);
 		if (rc < 0) {
 			pr_err("Unable to parse platfrom data rc=%d\n", rc);
-			goto exit2;
+			goto exit;
 		}
 	}
 
-	/* set pintrl */
-	rc = akm09970_pinctrl_init(pctrl);
-	if (!rc && pctrl->pinctrl) {
-		rc = pinctrl_select_state(pctrl->pinctrl, pctrl->pinctrl_default);
-		if (rc < 0) {
-			pr_err("Failed to select default pinstate %d\n", rc);
-		}
+	c_ctrl->dev = &client->dev;
+	c_ctrl->client = client;
+	i2c_set_clientdata(client, c_ctrl);
+
+	rc = akm09970_pinctrl_init(c_ctrl);
+	if (rc) {
+		pr_err("Failed to initialize pinctrl\n");
+		goto exit;
 	} else {
-		pr_err("Failed to init pinctrl\n");
+		if (c_ctrl->pinctrl) {
+			rc = akm09970_pinctrl_select(c_ctrl, true);
+			if (rc < 0) {
+				pr_err("Failed to select default pinstate %d\n", rc);
+				goto err_select_pinctrl;
+			}
+		}
 	}
 
-	/* gpio config */
-	rc = akm09970_gpio_config(pctrl);
+	rc = akm09970_gpio_config(c_ctrl);
 	if (rc < 0) {
 		pr_err("Failed to config gpio\n");
-		goto exit2;
+		goto err_select_pinctrl;
 	}
 
-	/* check connection */
-	rc = akm09970_regulator_init(pctrl, 1);
+	rc = akm09970_regulator_init(c_ctrl, true);
 	if (rc < 0)
-		goto exit2;
-	rc = akm_power_up(pctrl);
+		goto err_regulator_init;
+
+	rc = akm09970_check_device_id(c_ctrl);
 	if (rc < 0)
-		goto exit3;
+		goto err_check_device;
 
-	rc = akm_i2c_check_device(client);
-	if (rc < 0) {
-		dev_err(&client->dev, "%s check device failed: %d", __func__, rc);
-		goto exit4;
-	}
+	atomic_set(&c_ctrl->power_enabled, 0);
 
-	rc = akm09970_input_register(&pctrl->input);
-	if (rc) {
-		pr_err("input_dev register failed %d", __func__, rc);
-		goto exit4;
-	}
-	input_set_drvdata(pctrl->input, pctrl);
+	pr_err("IRQ is #%d.", c_ctrl->irq);
 
-	pctrl->irq = client->irq;
-	pr_debug("IRQ is #%d.", pctrl->irq);
-
-	/* init report work queue */
-	pctrl->work_queue = alloc_workqueue("akm_poll_work",
+	c_ctrl->work_queue = alloc_workqueue("akm09970_poll_work_queue",
 		WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_HIGHPRI, 1);
-	INIT_WORK(&pctrl->report_work, akm_dev_input_work);
+	INIT_WORK(&c_ctrl->report_work, akm09970_dev_work_queue);
 
-	if (pctrl->irq) {
-//		rc = request_irq(client->irq, akm_irq, IRQF_TRIGGER_FALLING, client->name, pctrl);
-		rc = request_threaded_irq(
-				client->irq,
-				NULL,
-				akm_irq,
-				IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
-				client->name,
-				pctrl);
-		if (rc < 0) {
-			pr_err("request irq failed.");
-			goto exit5;
-		}
-	}
-	disable_irq_nosync(pctrl->client->irq);
-
-	pctrl->miscdev.minor = MISC_DYNAMIC_MINOR;
-	pctrl->miscdev.name = AKM_MISCDEV_NAME;
-	pctrl->miscdev.fops = &akm09970_fops;
-	pctrl->miscdev.parent = &pctrl->client->dev;
-	rc = misc_register(&pctrl->miscdev);
-	if (rc) {
-		pr_err("misc register failed!");
-		goto exit6;
+	c_ctrl->chr_class = class_create(THIS_MODULE, AKM09970_CLASS_NAME);
+	if (c_ctrl->chr_class == NULL) {
+		pr_err("Failed to create class.\n");
+		rc = -ENODEV;
+		goto err_check_device;
 	}
 
-	akm_power_down(pctrl);
-
-	mutex_init(&pctrl->soc_mutex);
-	init_waitqueue_head(&pctrl->drdy_wq);
-	atomic_set(&pctrl->drdy, 0);
-
-	pctrl->debugfs = debugfs_create_dir("akm", NULL);
-	if (pctrl->debugfs) {
-		debugfs_create_u32("measure_freq_hz", 0664, pctrl->debugfs,
-				&pctrl->measure_freq_hz);
-
-		debugfs_create_file("sensor_id", 0444, pctrl->debugfs, pctrl,
-				&sensor_id_fops);
-		debugfs_create_file("dump", 0444, pctrl->debugfs, pctrl,
-				&dump_reg_fops);
+	rc = alloc_chrdev_region(&c_ctrl->dev_num, 0, 1, AKM09970_DRV_NAME);
+	if (rc < 0) {
+		pr_err("Failed to allocate chrdev region\n");
+		goto err_destroy_class;
 	}
 
-	dev_info(&client->dev, "%s successfully probed.", __func__);
+	c_ctrl->chr_dev = device_create(c_ctrl->chr_class, NULL,
+					c_ctrl->dev_num, c_ctrl, AKM09970_DRV_NAME);
+	if (IS_ERR(c_ctrl->chr_dev)) {
+		pr_err("Failed to create char device\n");
+		rc = PTR_ERR(c_ctrl->chr_dev);
+		goto err_unregister_chrdev;
+	}
+
+	cdev_init(&(c_ctrl->cdev), &akm09970_fops);
+	c_ctrl->cdev.owner = THIS_MODULE;
+
+	rc = cdev_add(&(c_ctrl->cdev), c_ctrl->dev_num, 1);
+	if (rc < 0) {
+		pr_err("Failed to add cdev\n");
+		goto err_destroy_device;
+	}
+
+	rc = device_create_file(c_ctrl->chr_dev, akm_attrs[0]);
+	if (rc < 0)
+		pr_err("Failed to create debug file: %d\n", rc);
+
+	pr_err("Probe exit");
+
 	return 0;
 
-exit6:
-	if (pctrl->irq)
-		free_irq(pctrl->irq, pctrl);
-	if (gpio_is_valid(pctrl->irq))
-		gpio_free(pctrl->irq);
-exit5:
-	input_unregister_device(pctrl->input);
-exit4:
-	akm_power_down(pctrl);
-exit3:
-	akm09970_regulator_init(pctrl, 0);
-exit2:
-	kfree(pctrl);
-exit1:
+
+err_destroy_device:
+	if (c_ctrl->chr_dev)
+		device_destroy(c_ctrl->chr_class, c_ctrl->dev_num);
+
+err_unregister_chrdev:
+	unregister_chrdev_region(c_ctrl->dev_num, 1);
+err_destroy_class:
+	if (c_ctrl->chr_class)
+		class_destroy(c_ctrl->chr_class);
+
+err_check_device:
+	akm09970_regulator_init(c_ctrl, false);
+
+err_regulator_init:
+        if (gpio_is_valid(c_ctrl->gpio_irq)) {
+		if (c_ctrl->irq)
+			free_irq(c_ctrl->irq, c_ctrl);
+                gpio_free(c_ctrl->gpio_irq);
+	}
+
+	if (gpio_is_valid(c_ctrl->gpio_reset))
+		gpio_free(c_ctrl->gpio_reset);
+
+err_select_pinctrl:
+	if (c_ctrl->pinctrl) {
+		devm_pinctrl_put(c_ctrl->pinctrl);
+		c_ctrl->pinctrl = NULL;
+	}
+
+exit:
 	return rc;
 }
 
 static int akm09970_remove(struct i2c_client *client)
 {
-	struct akm09970_soc_ctrl *pctrl = i2c_get_clientdata(client);
+	struct akm09970_soc_ctrl *c_ctrl = i2c_get_clientdata(client);
 
-	cancel_work_sync(&pctrl->report_work);
-	destroy_workqueue(pctrl->work_queue);
+	cancel_work_sync(&c_ctrl->report_work);
+	destroy_workqueue(c_ctrl->work_queue);
 
-	mutex_destroy(&pctrl->soc_mutex);
+	if (&(c_ctrl->cdev))
+		cdev_del(&(c_ctrl->cdev));
 
-	if (akm_power_down(pctrl))
-		pr_err("power set failed.");
-	if (akm09970_regulator_init(pctrl, 0))
-		pr_err("power deinit failed.");
+        if (c_ctrl->chr_dev)
+                device_destroy(c_ctrl->chr_class, c_ctrl->dev_num);
 
-	misc_deregister(&pctrl->miscdev);
+        unregister_chrdev_region(c_ctrl->dev_num, 1);
+        if (c_ctrl->chr_class)
+                class_destroy(c_ctrl->chr_class);
 
-	if (pctrl->irq)
-		free_irq(pctrl->irq, pctrl);
+	akm09970_power_down(c_ctrl);
 
-	input_unregister_device(pctrl->input);
+        akm09970_regulator_init(c_ctrl, false);
 
-	kfree(pctrl);
+        if (gpio_is_valid(c_ctrl->gpio_irq)) {
+                if (c_ctrl->irq)
+                        free_irq(c_ctrl->irq, c_ctrl);
+                gpio_free(c_ctrl->gpio_irq);
+        }
 
-	pr_debug("successfully removed.");
+        if (gpio_is_valid(c_ctrl->gpio_reset))
+                gpio_free(c_ctrl->gpio_reset);
+
+        if (c_ctrl->pinctrl) {
+                devm_pinctrl_put(c_ctrl->pinctrl);
+                c_ctrl->pinctrl = NULL;
+        }
+
+	pr_debug("Removed exit");
+
 	return 0;
 }
 
 static const struct i2c_device_id akm09970_id[] = {
-	{AKM_I2C_NAME, 0 },
-	{ }
+	{AKM09970_DRV_NAME, 0},
+	{},
 };
 
+MODULE_DEVICE_TABLE(i2c, akm09970_id);
+
 static struct of_device_id akm09970_match_table[] = {
-	{ .compatible = "ak,ak09970", },
 	{ .compatible = "akm,akm09970", },
 	{ },
 };
 
 static struct i2c_driver akm09970_driver = {
-	.probe		= akm09970_probe,
-	.remove		= akm09970_remove,
-	.id_table	= akm09970_id,
 	.driver = {
-		.name	= AKM_I2C_NAME,
+		.name   = AKM09970_DRV_NAME,
 		.owner  = THIS_MODULE,
 		.of_match_table = akm09970_match_table,
 	},
+	.probe		= akm09970_probe,
+	.remove		= akm09970_remove,
+	.id_table	= akm09970_id,
 };
 
-static int __init akm09970_init(void)
-{
-	return i2c_add_driver(&akm09970_driver);
-}
+module_i2c_driver(akm09970_driver);
 
-static void __exit akm09970_exit(void)
-{
-	i2c_del_driver(&akm09970_driver);
-}
-
-module_init(akm09970_init);
-module_exit(akm09970_exit);
-
-MODULE_AUTHOR("ran fei <ranfei@xiaomi.com>");
+MODULE_AUTHOR("zhunengjin <zhunengjin@xiaomi.com>");
 MODULE_DESCRIPTION("AKM compass driver");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");
+MODULE_VERSION("2.0");
